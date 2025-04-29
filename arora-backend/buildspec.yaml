@@ -1,0 +1,68 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      golang: 1.23.5
+    commands:
+    - yum install -y zip
+  build:
+    commands:
+    - cd lambdas # we need to be in the lambdas directory
+    - | # we just use this to allow multiline command formatting for easier readability
+      for dir in */ ; do
+        dirname=${dir%/};
+        cd "$dirname";
+        GOOS=linux GOARCH=amd64 go build -mod=readonly -o bootstrap main.go || { echo "Bootstrap failed"; exit 1; };
+        if [ ! -f "bootstrap" ]; then
+          echo "Error: Bootstrap not created in $dirname";
+          exit 1;
+        fi
+        chmod +x bootstrap;
+        zip -j "../${dirname}.zip" bootstrap;
+        cd ..
+        aws lambda update-function-code \
+          --function-name "arora-search-${dirname}" \
+          --zip-file "fileb://${dirname}.zip" || { echo "Function code update failed"; exit 1; }
+        echo "Waiting for function update to complete..."
+        aws lambda wait function-updated \
+          --function-name "arora-search-${dirname}" \
+          || { echo "Wait for function update timed out"; exit 1; }
+        retry_count=0
+        max_retries=3
+        version=""
+        until [ "$version" ] || [ $retry_count -ge $max_retries ]; do
+          ((retry_count++))
+          echo "Publishing version (attempt $retry_count)"
+          version=$(aws lambda publish-version \
+            --function-name "arora-search-${dirname}" \
+            --description "PROD Release" | jq -r '.Version') && break
+          sleep 5
+        done
+        if [ -z "$version" ]; then
+          echo "Failed to publish version after $max_retries attempts"
+          exit 1
+        fi
+        aws lambda update-alias \
+          --function-name "arora-search-${dirname}" \
+          --name PROD \
+          --function-version "$version" \
+          --description "PROD Release" || \
+        aws lambda create-alias \
+          --function-name "arora-search-${dirname}" \
+          --name PROD \
+          --function-version "$version" \
+          --description "PROD Release" || { echo "Alias update/create failed"; exit 1; }
+      done
+    # the previous code does the following:
+    # 1. loop through the directories in the lambdas directory
+    # 2. set the directory name to the name of the current directory
+    # 3. cd into the directory we are working with
+    # 4. build the go binary as "bootstrap" (needed for lambda execution) (if this fails then exit)
+    # 5. check if the bootstrap file exists, if not then log and fail
+    # 6. make the bootstrap executable
+    # 7. zip the bootstrap file (this is what we send to the lambda function)
+    # 8. cd out of the directory we just worked with
+    # 9. deploy the new function code to lambda
+    # 10. publish a new lambda version based on the newly delivered code (a "PROD Release")
+    # 11. update the PROD alias to this new version (or create it if it doesnt exist, which should never happen)
